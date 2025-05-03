@@ -1,26 +1,35 @@
-﻿/*
+/*
  Name:		WaterPump.ino
- Created:	5/3/2025 1:22:42 PM
+ Created:	5/3/2025 16:06:42 PM
  Author:	Ehsan Zeidabadi
 */
 
 
-#include <WiFi.h>
-#include <WebServer.h>
-#include <Preferences.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
 #include <ArduinoJson.h>
-#include <HTTPClient.h>
-#include <esp_mac.h>
+#include <ESP8266HTTPClient.h>
 #include <WiFiClient.h>
-#include <ESPmDNS.h>
-#include <Update.h>
+#include <ESP8266mDNS.h>
+#include <ESP8266HTTPUpdate.h>
+#include <EEPROM.h>
 
 // متغیرهای سراسری
-Preferences preferences;
 uint32_t chipId = 0;
-int DeviceId = 1;
-String MacAddress = "";
+int DeviceId = 2;
 String SerialNumber = "";
+
+// ساختار تنظیمات WiFi
+struct WiFiConfig {
+    char ssid[32];           // 31 کاراکتر + null terminator
+    char password[64];       // 63 کاراکتر + null terminator
+    char staticIP[16];       // xxx.xxx.xxx.xxx + null terminator
+    char gateway[16];
+    char subnet[16];
+    char preferredDNS[16];
+    char alternateDNS[16];
+};
+
 
 // تنظیمات وای‌فای
 char ssid[32] = "";
@@ -28,7 +37,8 @@ char password[64] = "";
 IPAddress staticIP, gateway, subnet, preferredDNS, alternateDNS;
 
 // سرور وب برای پیکربندی (در حالت Access Point)
-WebServer server(80);
+ESP8266WebServer server(80);
+
 
 const char* host = "esp8266ashatechnic";
 
@@ -63,7 +73,6 @@ void loadWiFiConfig();
 void sendJsonToServer();
 void receiveJsonFromServer();
 void getStatus();
-String getInterfaceMacAddress(esp_mac_type_t interface);
 
 // صفحه لاگین
 const char* loginIndex =
@@ -153,7 +162,7 @@ const char* serverIndex =
 void setup() {
     //////delay(120000);// wait 2 minuts for wifi conecting
     Serial.begin(115200);
-
+    EEPROM.begin(512);
     // تنظیم پین‌های خروجی
     pinMode(WaterPumpRelay, OUTPUT);
 
@@ -163,19 +172,11 @@ void setup() {
     // تنظیم حالت اولیه رله‌ها
     digitalWrite(WaterPumpRelay, LOW); // غیر فعال
 
-    MacAddress = getInterfaceMacAddress(ESP_MAC_ETH);
-    Serial.print("Mac Address is: ");
-    Serial.println(MacAddress);
-
-    // تولید شناسه یکتا برای چیپ با استفاده از MAC
-    for (int i = 0; i < 17; i += 8) {
-        chipId |= ((ESP.getEfuseMac() >> (40 - i)) & 0xff) << i;
-    }
+    chipId = ESP.getChipId();
     SerialNumber = String(chipId);
-    Serial.print("Chip ID: ");
     Serial.println(SerialNumber);
 
-    // بارگذاری اطلاعات ذخیره‌شده از NVS
+    // بارگذاری اطلاعات ذخیره‌شده از ایپرام
     loadWiFiConfig();
 
     // اگر اطلاعات IP از قبل تنظیم شده باشد از آنها استفاده کنیم
@@ -213,27 +214,27 @@ void setup() {
         server.send(200, "text/html", serverIndex);
         });
 
+    // سرور برای به‌روزرسانی از طریق HTTP POST
     server.on("/update", HTTP_POST, []() {
-        server.sendHeader("Connection", "close");
         server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
         ESP.restart();
         }, []() {
             HTTPUpload& upload = server.upload();
             if (upload.status == UPLOAD_FILE_START) {
                 Serial.printf("Update: %s\n", upload.filename.c_str());
-                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
+                uint32_t maxSketchSpace = ESP.getFreeSketchSpace();
+                if (!Update.begin(maxSketchSpace)) {
                     Update.printError(Serial);
                 }
             }
             else if (upload.status == UPLOAD_FILE_WRITE) {
-                /* flashing firmware to ESP*/
                 if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
                     Update.printError(Serial);
                 }
             }
             else if (upload.status == UPLOAD_FILE_END) {
-                if (Update.end(true)) { //true to set the size to the current progress
-                    Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+                if (Update.end(true)) {
+                    Serial.printf("Update Success: %u bytes\nRebooting...\n", upload.totalSize);
                 }
                 else {
                     Update.printError(Serial);
@@ -290,7 +291,7 @@ void startAccessPoint() {
         page += "<br>";
         page += "<tr><td colspan=2><center><fontsize=3><b>Serial Number: " + SerialNumber + "</b></font></center><br></td><tr>";
         page += "<br>";
-        page += "<tr><td colspan=2><center><fontsize=3><b>MAC Address: " + MacAddress + "</b></font></center><br></td><tr>";
+        //page += "<tr><td colspan=2><center><fontsize=3><b>MAC Address: " + MacAddress + "</b></font></center><br></td><tr>";
         page += "<br>";
         page += "<form method='POST' action='/save'>";
         page += "<label for='ssid'>نام شبکه (SSID):</label>";
@@ -357,7 +358,7 @@ void startWiFiConfig() {
         page += "<br>";
         page += "<tr><td colspan=2><center><fontsize=3><b>Serial Number: " + SerialNumber + "</b></font></center><br></td><tr>";
         page += "<br>";
-        page += "<tr><td colspan=2><center><fontsize=3><b>MAC Address: " + MacAddress + "</b></font></center><br></td><tr>";
+        //page += "<tr><td colspan=2><center><fontsize=3><b>MAC Address: " + MacAddress + "</b></font></center><br></td><tr>";
         page += "<br>";
         page += "<form method='POST' action='/save'>";
         page += "<label for='ssid'>نام شبکه (SSID):</label>";
@@ -405,43 +406,70 @@ void startWiFiConfig() {
 }
 
 void saveWiFiConfig() {
-    preferences.begin("wifi", false);
-    preferences.putString("ssid", String(ssid));
-    preferences.putString("password", String(password));
-    preferences.putString("staticIP", staticIP.toString());
-    preferences.putString("gateway", gateway.toString());
-    preferences.putString("subnet", subnet.toString());
-    preferences.putString("preferredDNS", preferredDNS.toString());
-    preferences.putString("alternateDNS", alternateDNS.toString());
-    preferences.end();
+    // شروع و اختصاص حافظه برای EEPROM
+    EEPROM.begin(EEPROM_SIZE);
+
+    // انتقال اطلاعات تنظیمات به ساختار، با اطمینان از قطع شدن رشته (null termination)
+    strncpy(wifiConfig.ssid, ssid.c_str(), sizeof(wifiConfig.ssid));
+    wifiConfig.ssid[sizeof(wifiConfig.ssid) - 1] = '\0';
+
+    strncpy(wifiConfig.password, password.c_str(), sizeof(wifiConfig.password));
+    wifiConfig.password[sizeof(wifiConfig.password) - 1] = '\0';
+
+    String ipStr = staticIP.toString();
+    strncpy(wifiConfig.staticIP, ipStr.c_str(), sizeof(wifiConfig.staticIP));
+    wifiConfig.staticIP[sizeof(wifiConfig.staticIP) - 1] = '\0';
+
+    String gwStr = gateway.toString();
+    strncpy(wifiConfig.gateway, gwStr.c_str(), sizeof(wifiConfig.gateway));
+    wifiConfig.gateway[sizeof(wifiConfig.gateway) - 1] = '\0';
+
+    String subnetStr = subnet.toString();
+    strncpy(wifiConfig.subnet, subnetStr.c_str(), sizeof(wifiConfig.subnet));
+    wifiConfig.subnet[sizeof(wifiConfig.subnet) - 1] = '\0';
+
+    String pDnsStr = preferredDNS.toString();
+    strncpy(wifiConfig.preferredDNS, pDnsStr.c_str(), sizeof(wifiConfig.preferredDNS));
+    wifiConfig.preferredDNS[sizeof(wifiConfig.preferredDNS) - 1] = '\0';
+
+    String aDnsStr = alternateDNS.toString();
+    strncpy(wifiConfig.alternateDNS, aDnsStr.c_str(), sizeof(wifiConfig.alternateDNS));
+    wifiConfig.alternateDNS[sizeof(wifiConfig.alternateDNS) - 1] = '\0';
+
+    // ذخیره کل ساختار در EEPROM از آدرس 0
+    EEPROM.put(0, wifiConfig);
+
+    // اطمینان از انتقال داده به حافظه فلاش
+    EEPROM.commit();
+
+    // پایان کار با EEPROM
+    EEPROM.end();
 }
+
 
 void loadWiFiConfig() {
-    preferences.begin("wifi", true);
+    // شروع کار با EEPROM با تخصیص حافظه لازم
+    EEPROM.begin(EEPROM_SIZE);
 
-    String tmp = preferences.getString("ssid", "");
-    tmp.toCharArray(ssid, sizeof(ssid));
+    WiFiConfig wifiConfig;
+    // خواندن اطلاعات ساختار ذخیره‌شده از آدرس 0
+    EEPROM.get(0, wifiConfig);
 
-    tmp = preferences.getString("password", "");
-    tmp.toCharArray(password, sizeof(password));
+    // خاتمه کار با EEPROM
+    EEPROM.end();
 
-    tmp = preferences.getString("staticIP", "");
-    staticIP.fromString(tmp);
+    // انتقال اطلاعات خوانده شده به متغیرهای global
+    strcpy(ssid, wifiConfig.ssid);
+    strcpy(password, wifiConfig.password);
 
-    tmp = preferences.getString("gateway", "");
-    gateway.fromString(tmp);
-
-    tmp = preferences.getString("subnet", "");
-    subnet.fromString(tmp);
-
-    tmp = preferences.getString("preferredDNS", "");
-    preferredDNS.fromString(tmp);
-
-    tmp = preferences.getString("alternateDNS", "");
-    alternateDNS.fromString(tmp);
-
-    preferences.end();
+    // توجه کنید که toString() نیاز به نوع String دارد. از سازنده String برای تبدیل آرایه کاراکتری استفاده می‌کنیم.
+    staticIP.fromString(String(wifiConfig.staticIP));
+    gateway.fromString(String(wifiConfig.gateway));
+    subnet.fromString(String(wifiConfig.subnet));
+    preferredDNS.fromString(String(wifiConfig.preferredDNS));
+    alternateDNS.fromString(String(wifiConfig.alternateDNS));
 }
+
 
 void sendJsonToServer() {
     if (WiFi.status() == WL_CONNECTED) {
@@ -453,11 +481,8 @@ void sendJsonToServer() {
 
         StaticJsonDocument<200> doc;
         doc["deviceId"] = DeviceId;
-        doc["boardSensorTemperature"] = dht_val[0];
-        doc["coldRoomTemperature"] = dht_val[1];
-        doc["coldRoomStatus"] = WaterPumpRelayStatus;
-        doc["defrostStatus"] = false;
-        doc["motorStatus"] = WaterPumpStatus;
+        doc["WaterPumpRelayStatus"] = WaterPumpRelayStatus;
+        doc["WaterPumpStatus"] = WaterPumpStatus;
 
         String requestBody;
         serializeJson(doc, requestBody);
@@ -498,9 +523,9 @@ void receiveJsonFromServer() {
                 if (deviceId == DeviceId) {
                     Serial.print("deviceId: ");
                     Serial.println(deviceId);
-                    if (doc["coldRoomStatus"] != waterPumpRelayStatus) {
-                        waterPumpRelayStatus = doc["coldRoomStatus"];
-                        Serial.print("coldRoomStatus: ");
+                    if (doc["WaterPumpRelayStatus"] != waterPumpRelayStatus) {
+                        waterPumpRelayStatus = doc["WaterPumpRelayStatus"];
+                        Serial.print("WaterPumpRelayStatus: ");
                         Serial.println(waterPumpRelayStatus ? "true" : "false");
                         if (waterPumpRelayStatus) {
                             digitalWrite(WaterPumpRelay, LOW); // فعال
@@ -509,14 +534,14 @@ void receiveJsonFromServer() {
                             digitalWrite(WaterPumpRelay, HIGH); // غیر فعال
                         }
                     }
-                    if (doc["motorStatus"] != waterPumpStatus) {
-                        waterPumpStatus = doc["motorStatus"];
-                        Serial.print("motorStatus: ");
+                    if (doc["WaterPumpStatus"] != waterPumpStatus) {
+                        waterPumpStatus = doc["WaterPumpStatus"];
+                        Serial.print("WaterPumpStatus: ");
                         Serial.println(waterPumpStatus ? "true" : "false");
                     }
-                    if (doc["coldRoomTimerStatus"] != waterPumpTimerStatus) {
-                        waterPumpTimerStatus = doc["coldRoomTimerStatus"];
-                        Serial.print("coldRoomTimerStatus: ");
+                    if (doc["waterPumpTimerStatus"] != waterPumpTimerStatus) {
+                        waterPumpTimerStatus = doc["waterPumpTimerStatus"];
+                        Serial.print("waterPumpTimerStatus: ");
                         Serial.println(waterPumpTimerStatus ? "true" : "false");
                     }
                 }
@@ -571,18 +596,4 @@ void getStatus() {
     if (statusChanged) {
         sendJsonToServer();
     }
-}
-
-String getInterfaceMacAddress(esp_mac_type_t interface) {
-    String mac = "";
-    unsigned char mac_base[6] = { 0 };
-
-    if (esp_read_mac(mac_base, interface) == ESP_OK) {
-        char buffer[18]; // فرمت: AA:BB:CC:DD:EE:FF + null termination
-        sprintf(buffer, "%02X:%02X:%02X:%02X:%02X:%02X",
-            mac_base[0], mac_base[1], mac_base[2],
-            mac_base[3], mac_base[4], mac_base[5]);
-        mac = buffer;
-    }
-    return mac;
 }
